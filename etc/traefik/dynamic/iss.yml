@@ -1,13 +1,13 @@
 tls:
   certificates:
-    - certFile: /etc/traefik/certs/<CA_HOSTNAME>.local.pem
-      keyFile: /etc/traefik/certs/<CA_HOSTNAME>.local-key.pem
+    - certFile: <ISS_CONFIG_DIR>/certs/<CA_HOSTNAME>.local.pem
+      keyFile: <ISS_CONFIG_DIR>/certs/<CA_HOSTNAME>.local-key.pem
   options:
     mtls:
       clientAuth:
         caFiles:
-          - /etc/traefik/dynamic/root_ca.crt
-          - /etc/traefik/dynamic/intermediate_ca.crt
+          - <ISS_CONFIG_DIR>/dynamic/root_ca.crt
+          - <ISS_CONFIG_DIR>/dynamic/intermediate_ca.crt
         clientAuthType: RequireAndVerifyClientCert
 http:
   routers:
@@ -26,7 +26,7 @@ http:
       rule: "Host(`<CA_HOSTNAME>.local`)"
       entryPoints: [web]
       middlewares: [redirect-https-mw]
-      service: noop@internal
+      service: dummy@internal
   middlewares:
     redirect-https-mw:
       redirectScheme:
@@ -43,3 +43,8 @@ http:
         passHostHeader: true
         servers:
           - url: "http://127.0.0.1:<ENROLL_PORT>"
+    dummy:
+      loadBalancer:
+        passHostHeader: false
+        servers:
+          - url: "http://127.0.0.1:1"

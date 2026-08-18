@@ -3,25 +3,24 @@
 # Idempotent. Re-running on a configured host is safe.
 #
 # Variables come from .env (see .env.example):
-#   CA_HOSTNAME         - mDNS hostname of the CA host (also daemons's host-name)
-#   CA_NAME             - CA cert subject O
+#   CA_HOSTNAME         - mDNS hostname of the CA host (avahi host-name)
+#   CA_NAME             - CA cert subject O (Organization)
 #   CA_IP               - CA host's LAN IP
 #   JOIN_AS_CA          - true on CA host, false on join hosts
 #   ENROLL_HOUSEHOLD_PASSWORD - shared password for the enroll page
 #   ENROLL_P12_PASSWORD  - .p12 install password
-#   DASHBOARD_PORT      - port the operator's dashboard listens on (default 9119)
-#   ENROLL_PORT         - port the enroll app listens on (default 9120)
+#   ISS_USER            - Linux user the app runs as
+#   ISS_HOME            - Linux user's home dir
+#   ISS_CONFIG_DIR      - config dir (default /etc/iss)
+#   ISS_STATE_DIR       - runtime state dir (default /var/lib/iss)
 
 set -euo pipefail
 trap 'echo "BOOTSTRAP FAILED at line $LINENO" >&2' ERR
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-if [[ ! -f "$REPO_ROOT/.env" ]]; then
-  echo "FATAL: .env not found. Run: cp .env.example .env and fill in values." >&2
-  exit 1
-fi
 # shellcheck disable=SC1091
+[ -f "$REPO_ROOT/.env" ] || { echo "FATAL: .env not found at $REPO_ROOT/.env" >&2; exit 1; }
 source "$REPO_ROOT/.env"
 
 : "${CA_HOSTNAME:?must be set}"
@@ -30,12 +29,16 @@ source "$REPO_ROOT/.env"
 : "${ENROLL_HOUSEHOLD_PASSWORD:?must be set}"
 : "${ENROLL_P12_PASSWORD:?must be set}"
 : "${JOIN_AS_CA:=true}"
-: "${DASHBOARD_PORT:=9119}"
-: "${ENROLL_PORT:=9120}"
+: "${DASHBOARD_PORT:=8080}"
+: "${ENROLL_PORT:=8081}"
+: "${ISS_USER:=dev}"
+: "${ISS_HOME:=/home/dev}"
+: "${ISS_CONFIG_DIR:=/etc/iss}"
+: "${ISS_STATE_DIR:=/var/lib/iss}"
+: "${ISS_NAME:=ISS}"
 
-# step-cli 0.30.x requires OpenSSL >= 3.5 for chain validation to work with
-# its --root flag. Ubuntu 24.04 ships with 3.0 which causes cert verify
-# failures. Refuse to continue on too-old OpenSSL.
+# step-cli 0.30.x requires OpenSSL >= 3.5 for chain validation. Older
+# OpenSSL (e.g. Ubuntu 24.04 ships 3.0) causes cert verify failures.
 _OPENSSL_VERSION=$(openssl version | awk '{print $2}')
 _OPENSSL_MAJOR=$(echo "$_OPENSSL_VERSION" | cut -d. -f1)
 _OPENSSL_MINOR=$(echo "$_OPENSSL_VERSION" | cut -d. -f2)
@@ -45,9 +48,9 @@ if [[ "$_OPENSSL_MAJOR" -lt 3 || ("$_OPENSSL_MAJOR" -eq 3 && "$_OPENSSL_MINOR" -
   exit 1
 fi
 
-# Validate inputs.
+# Validate CA_HOSTNAME: single label, lowercase, digits, hyphens.
 if [[ ! "$CA_HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
-  echo "CA_HOSTNAME must be a single label (lowercase, digits, hyphens; no leading/trailing hyphen)." >&2
+  echo "FATAL: CA_HOSTNAME must be a single label (lowercase, digits, hyphens; no leading/trailing hyphen)." >&2
   exit 1
 fi
 
@@ -56,42 +59,70 @@ if [[ "$JOIN_AS_CA" == "true" && "$CA_HOSTNAME" == "$(hostname -s)" ]]; then
   IS_CA_HOST=true
 fi
 
-apt-get update -y
-apt-get install -y avahi-daemon avahi-utils curl wget ca-certificates gnupg
+ISS_SCRIPTS_DIR="$ISS_HOME/.local/share/iss/scripts"
+ENROLL_BASENAME="enroll.js"
 
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+# Package installs.
+if ! dpkg -l nodejs 2>/dev/null | grep -q "^ii"; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
   apt-get install -y nodejs
 fi
 
+# Install the enroll app's npm dependencies once.
+mkdir -p "$ISS_HOME/.local/share/iss/npm"
+cat > "$ISS_HOME/.local/share/iss/npm/package.json" <<'EOF'
+{
+  "name": "iss-enroll",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "hono": "^4.0.0",
+    "@hono/node-server": "^1.0.0"
+  }
+}
+EOF
+cd "$ISS_HOME/.local/share/iss/npm"
+npm install --silent --no-audit --no-fund
+
 if ! command -v step >/dev/null 2>&1; then
-  # Pin to a version known to verify step-ca's cert with --root correctly.
-  STEP_CLI_VERSION=0.30.5
-  STEP_CA_VERSION=0.30.1
+  STEP_CLI_VERSION=0.30.6
+  STEP_CA_VERSION=0.30.2
   cd /tmp
   wget -q "https://github.com/smallstep/cli/releases/download/v${STEP_CLI_VERSION}/step-cli_${STEP_CLI_VERSION}-1_amd64.deb"
   wget -q "https://github.com/smallstep/certificates/releases/download/v${STEP_CA_VERSION}/step-ca_${STEP_CA_VERSION}-1_amd64.deb"
   apt-get install -y "./step-cli_${STEP_CLI_VERSION}-1_amd64.deb" "./step-ca_${STEP_CA_VERSION}-1_amd64.deb"
-  rm -f /tmp/step-cli_*.deb /tmp/step-ca_*.deb
+  rm -f /tmp/step-cli-*.deb /tmp/step-ca-*.deb
 fi
 
 if [[ ! -x /usr/local/bin/traefik ]]; then
   TRAEFIK_VERSION=3.6.25
+  cd /tmp
   wget -q -O /tmp/traefik.tar.gz "https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_v${TRAEFIK_VERSION}_linux_amd64.tar.gz"
   tar -xzf /tmp/traefik.tar.gz -C /tmp traefik
   install -m 0755 /tmp/traefik /usr/local/bin/traefik
   rm -f /tmp/traefik /tmp/traefik.tar.gz
 fi
 
-mkdir -p /root/.step
-mkdir -p /etc/traefik/dynamic
-mkdir -p /etc/traefik/certs
-mkdir -p /etc/hermes
-mkdir -p /home/dev/.hermes/scripts
-mkdir -p /var/lib/hermes-enroll
+apt-get install -y avahi-daemon avahi-utils curl wget ca-certificates gnupg
 
-# Set the host's avahi name from CA_HOSTNAME so it broadcasts as <CA_HOSTNAME>.local.
-sed -i "s|^host-name=.*|host-name=${CA_HOSTNAME}|" /etc/avahi/avahi-daemon.conf 2>/dev/null || true
+# Ensure operator user exists.
+if ! id -u "$ISS_USER" >/dev/null 2>&1; then
+  useradd -m -d "$ISS_HOME" "$ISS_USER"
+fi
+
+mkdir -p "$ISS_CONFIG_DIR/certs" "$ISS_CONFIG_DIR/dynamic"
+mkdir -p /etc/traefik              # Traefik config dir (system location)
+mkdir -p "$ISS_HOME/.local/share/iss/scripts"
+mkdir -p "$ISS_STATE_DIR/enroll"
+
+# Avahi host-name from CA_HOSTNAME. The committed config has no host-name=
+# line; bootstrap appends it under [server].
+if ! grep -q "^host-name=" /etc/avahi/avahi-daemon.conf; then
+  sed -i "/^\[server\]/a host-name=${CA_HOSTNAME}" /etc/avahi/avahi-daemon.conf
+else
+  sed -i "s|^host-name=.*|host-name=${CA_HOSTNAME}|" /etc/avahi/avahi-daemon.conf
+fi
 
 if $IS_CA_HOST; then
   if [[ ! -f /root/.step/config/ca.json ]]; then
@@ -102,122 +133,134 @@ if $IS_CA_HOST; then
       --address="127.0.0.1:8443" \
       --provisioner="admin" \
       --password-file=/root/.step-pw
-    python3 -c "
+  fi
+
+  # Patch ca.json to enable CRL export and longer default durations.
+  python3 - <<PYEOF
 import json
 p='/root/.step/config/ca.json'
 d=json.load(open(p))
 d['crl']={'enabled':True,'path':'/root/.step/crl.pem'}
-d['authority']['claims']=d.get('authority',{}).get('claims',{})
-d['authority']['claims']['maxTLSCertDuration']='8760h0m0s'
-d['authority']['claims']['defaultTLSCertDuration']='8760h0m0s'
+a=d.setdefault('authority',{})
+c=a.setdefault('claims',{})
+c['maxTLSCertDuration']='8760h0m0s'
+c['defaultTLSCertDuration']='8760h0m0s'
 json.dump(d, open(p,'w'), indent=2)
-"
-    grep -q "^ca.local" /etc/hosts || echo "127.0.0.1 ca.local" >> /etc/hosts
-  fi
+PYEOF
 
-  # Install the step-ca service unit (idempotent) so we can talk to the daemon.
+  grep -q "^ca.local" /etc/hosts || echo "127.0.0.1 ca.local" >> /etc/hosts
+
+  # Install step-ca unit and start the daemon.
   install -m 0644 "$REPO_ROOT/etc/systemd/system/step-ca.service" /etc/systemd/system/step-ca.service
   systemctl daemon-reload
   systemctl enable --now step-ca
 
-  # Wait for step-ca to be reachable.
   for _ in $(seq 1 30); do
-    if curl -ksf https://ca.local:8443/health >/dev/null 2>&1; then
-      break
-    fi
+    if curl -ksf https://ca.local:8443/health >/dev/null 2>&1; then break; fi
     sleep 1
   done
 
-  if [[ ! -f /etc/traefik/dynamic/root_ca.crt ]]; then
-    STEPPATH=/root/.step /usr/bin/step ca provisioner add acme --type ACME \
-      --ca-url https://ca.local:8443 --root /root/.step/certs/root_ca.crt \
-      --password-file /root/.step-pw
-  fi
+  # Add ACME provisioner (optional, for automation).
+  STEPPATH=/root/.step /usr/bin/step ca provisioner add acme --type ACME \
+    --ca-url https://ca.local:8443 --root /root/.step/certs/root_ca.crt \
+    --password-file /root/.step-pw || true
 
-  DASHBOARD_HOSTNAME="${CA_HOSTNAME}.local"
-  STEPPATH=/root/.step /usr/bin/step ca certificate "${DASHBOARD_HOSTNAME}" \
-    /etc/traefik/certs/${CA_HOSTNAME}.local.pem \
-    /etc/traefik/certs/${CA_HOSTNAME}.local-key.pem \
-    --provisioner admin \
-    --provisioner-password-file /root/.step-pw \
-    --san "${DASHBOARD_HOSTNAME}" --san "${CA_IP}" --not-after 2160h
-  cp /root/.step/certs/root_ca.crt /etc/traefik/dynamic/root_ca.crt
-  cp /root/.step/certs/intermediate_ca.crt /etc/traefik/dynamic/intermediate_ca.crt
+  # Issue the CA host's server cert.
+  STEPPATH=/root/.step /usr/bin/step ca certificate "${CA_HOSTNAME}.local" \
+    "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local.pem" \
+    "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local-key.pem" \
+    --provisioner admin --provisioner-password-file /root/.step-pw \
+    --san "${CA_HOSTNAME}.local" --san "${CA_IP}" --not-after 2160h
+
+  cp /root/.step/certs/root_ca.crt "$ISS_CONFIG_DIR/dynamic/root_ca.crt"
+  cp /root/.step/certs/intermediate_ca.crt "$ISS_CONFIG_DIR/dynamic/intermediate_ca.crt"
 fi
 
-# Idempotent: skip the step-ca systemctl in the loop below if we're CA host.
-SKIP_STEPCA_ENABLE=$IS_CA_HOST
-
-if ! $IS_CA_HOST; then
-  if [[ ! -f /etc/traefik/dynamic/root_ca.crt ]]; then
-    scp "dev@${CA_IP}:/root/.step/certs/root_ca.crt" /etc/traefik/dynamic/root_ca.crt
-    scp "dev@${CA_IP}:/root/.step/certs/intermediate_ca.crt" /etc/traefik/dynamic/intermediate_ca.crt
-  fi
-fi
-
-# Install Traefik configs.
+# Traefik configs (used on both CA and join hosts).
 install -m 0644 "$REPO_ROOT/etc/traefik/traefik.yml" /etc/traefik/traefik.yml
-install -m 0644 "$REPO_ROOT/etc/traefik/dynamic/hermes.yml" /etc/traefik/dynamic/hermes.yml
+install -m 0644 "$REPO_ROOT/etc/traefik/dynamic/iss.yml" "$ISS_CONFIG_DIR/dynamic/iss.yml"
 
-# Substitute placeholders in Traefik dynamic config (only file with placeholders).
+# Substitute placeholders in the dynamic config.
 sed -i \
   -e "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" \
   -e "s|<DASHBOARD_PORT>|${DASHBOARD_PORT}|g" \
   -e "s|<ENROLL_PORT>|${ENROLL_PORT}|g" \
-  /etc/traefik/dynamic/hermes.yml
+  -e "s|<HOME_DIR>|${ISS_HOME}|g" \
+  -e "s|<ISS_CONFIG_DIR>|${ISS_CONFIG_DIR}|g" \
+  -e "s|<ISS_HOME>|${ISS_HOME}|g" \
+  "$ISS_CONFIG_DIR/dynamic/iss.yml"
 
-# Install avahi config.
-install -m 0644 "$REPO_ROOT/etc/avahi/avahi-daemon.conf" /etc/avahi/avahi-daemon.conf
-
-# Install systemd units.
-install -m 0644 "$REPO_ROOT/etc/systemd/system/step-ca.service" /etc/systemd/system/step-ca.service
-install -m 0644 "$REPO_ROOT/etc/systemd/system/traefik.service" /etc/systemd/system/traefik.service
-
-# Rename the enroll service unit to the operator's brand, substituting its
-# ExecStart and Description so it actually runs after the rename.
-if [[ -f "$REPO_ROOT/etc/systemd/system/hermes-enroll.service" ]]; then
-  src="/etc/systemd/system/hermes-enroll.service"
-  dst="/etc/systemd/system/${CA_HOSTNAME}-enroll.service"
-  if [[ ! -f "$dst" ]]; then
-    install -m 0644 "$REPO_ROOT/etc/systemd/system/hermes-enroll.service" "$src"
-    sed -i \
-      -e "s|Description=.*|Description=${CA_HOSTNAME} cert enrollment|" \
-      -e "s|/home/dev/.hermes/scripts/hermes-enroll\\.js|/home/dev/.hermes/scripts/${CA_HOSTNAME}-enroll.js|" \
-      "$src"
-    mv "$src" "$dst"
+if ! $IS_CA_HOST; then
+  if [[ ! -f "$ISS_CONFIG_DIR/dynamic/root_ca.crt" ]]; then
+    scp "root@${CA_IP}:/root/.step/certs/root_ca.crt" "$ISS_CONFIG_DIR/dynamic/root_ca.crt"
+    scp "root@${CA_IP}:/root/.step/certs/intermediate_ca.crt" "$ISS_CONFIG_DIR/dynamic/intermediate_ca.crt"
   fi
 fi
 
-# Install templates with placeholder substitution.
-if [[ ! -f /etc/hermes/acl.json ]]; then
-  install -m 0644 "$REPO_ROOT/templates/acl.json" /etc/hermes/acl.json
-fi
-sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" /etc/hermes/acl.json
+# Traefik unit (uses operator paths).
+cat > /etc/systemd/system/traefik.service <<EOF
+[Unit]
+Description=Traefik reverse proxy (Internal Service System)
+After=network-online.target
+Wants=network-online.target
 
-# Install the enroll app JS, renamed to the operator's brand.
-SCRIPT_DIR=/home/dev/.hermes/scripts
-src_js="$REPO_ROOT/scripts/hermes-enroll.js"
-dst_js="$SCRIPT_DIR/${CA_HOSTNAME}-enroll.js"
-if [[ ! -f "$dst_js" && -f "$src_js" ]]; then
-  install -m 0755 "$src_js" "$dst_js"
-fi
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/traefik --configFile=/etc/traefik/traefik.yml --providers.file.directory=${ISS_CONFIG_DIR}/dynamic
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=8192
+StandardOutput=journal
+StandardError=journal
 
-if [[ ! -d "$SCRIPT_DIR/node_modules" ]]; then
-  cd "$SCRIPT_DIR"
-  npm init -y >/dev/null 2>&1
-  npm install hono @hono/node-server >/dev/null 2>&1
-fi
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# Drop-in for env vars. NEVER commit these to the unit file.
-mkdir -p "/etc/systemd/system/${CA_HOSTNAME}-enroll.service.d"
-cat > "/etc/systemd/system/${CA_HOSTNAME}-enroll.service.d/env.conf" <<EOF
+if $IS_CA_HOST; then
+  # Install the enroll app script alongside node_modules.
+  install -m 0755 "$REPO_ROOT/scripts/iss-enroll.js" "$ISS_HOME/.local/share/iss/npm/${CA_HOSTNAME}-enroll.js"
+
+  # Render systemd unit from template.
+  ENROLL_RENDERED=$(mktemp)
+  sed \
+    -e "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" \
+    -e "s|<ISS_HOME>|${ISS_HOME}|g" \
+    -e "s|<ISS_USER>|${ISS_USER}|g" \
+    -e "s|<HOME_DIR>|${ISS_HOME}|g" \
+    -e "s|<ENROLL_PORT>|${ENROLL_PORT}|g" \
+    -e "s|<ISS_NAME>|${ISS_NAME}|g" \
+    -e "s|<ISS_SCRIPTS_DIR>|${ISS_HOME}/.local/share/iss/npm|g" \
+    "$REPO_ROOT/etc/systemd/system/iss-enroll.service" > "$ENROLL_RENDERED"
+  install -m 0644 "$ENROLL_RENDERED" "/etc/systemd/system/${CA_HOSTNAME}-enroll.service"
+  rm -f "$ENROLL_RENDERED"
+
+  # Drop-in with secrets and runtime paths.
+  mkdir -p "/etc/systemd/system/${CA_HOSTNAME}-enroll.service.d"
+  cat > "/etc/systemd/system/${CA_HOSTNAME}-enroll.service.d/env.conf" <<EOF
 [Service]
 Environment=STEPPATH=/root/.step
+Environment=ISS_STATE_DIR=${ISS_STATE_DIR}
+Environment=ISS_CONFIG_DIR=${ISS_CONFIG_DIR}
+Environment=CA_HOSTNAME=${CA_HOSTNAME}
+Environment=CA_IP=${CA_IP}
+Environment=CA_NAME=${CA_NAME}
+Environment=ISS_NAME=${ISS_NAME}
 Environment=ENROLL_HOUSEHOLD_PASSWORD=${ENROLL_HOUSEHOLD_PASSWORD}
 Environment=ENROLL_P12_PASSWORD=${ENROLL_P12_PASSWORD}
 Environment=ENROLL_PORT=${ENROLL_PORT}
-Environment=CA_IP=${CA_IP}
 EOF
+
+  # Install acl.json template if missing.
+  if [[ ! -f "$ISS_CONFIG_DIR/acl.json" ]]; then
+    install -m 0644 "$REPO_ROOT/templates/acl.json" "$ISS_CONFIG_DIR/acl.json"
+    sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" "$ISS_CONFIG_DIR/acl.json"
+  fi
+
+  # Write trailing service enable at the end (after units installed).
+  :
+fi
 
 systemctl daemon-reload
 
@@ -246,8 +289,18 @@ fi
 
 echo
 echo "=== Verification ==="
-curl -ksf https://ca.local:8443/health >/dev/null && echo "step-ca: OK" || echo "step-ca: FAIL"
-curl -sf "http://127.0.0.1:${ENROLL_PORT}/api/health" >/dev/null && echo "enroll: OK" || echo "enroll: FAIL"
+if curl -ksf https://ca.local:8443/health >/dev/null 2>&1; then
+  echo "step-ca: OK"
+else
+  echo "step-ca: FAIL"
+fi
+if $IS_CA_HOST; then
+  if curl -sf "http://127.0.0.1:${ENROLL_PORT}/api/health" >/dev/null 2>&1; then
+    echo "enroll: OK"
+  else
+    echo "enroll: FAIL"
+  fi
+fi
 
 echo
 echo "Bootstrap complete."

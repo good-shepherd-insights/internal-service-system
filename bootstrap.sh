@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Internal Service System — one-shot bootstrap.
 # Idempotent. Re-running on a configured host is safe.
+#
+# Variables come from .env (see .env.example):
+#   CA_HOSTNAME   - mDNS hostname of the CA host (also daemons's host-name)
+#   CA_NAME       - CA cert subject O
+#   CA_IP         - CA host's LAN IP
+#   JOIN_AS_CA    - true on CA host, false on join hosts
+#   HERMES_HOUSEHOLD_PASSWORD - shared password for the enroll page
+#   HERMES_P12_PASSWORD - .p12 install password
 
 set -euo pipefail
 trap 'echo "BOOTSTRAP FAILED at line $LINENO" >&2' ERR
@@ -14,14 +22,15 @@ fi
 # shellcheck disable=SC1091
 source "$REPO_ROOT/.env"
 
-: "${CA_HOST:?must be set}"
+: "${CA_HOSTNAME:?must be set}"
+: "${CA_NAME:?must be set}"
 : "${CA_IP:?must be set}"
 : "${HERMES_HOUSEHOLD_PASSWORD:?must be set}"
 : "${HERMES_P12_PASSWORD:?must be set}"
 : "${JOIN_AS_CA:=true}"
 
 IS_CA_HOST=false
-if [[ "$JOIN_AS_CA" == "true" && "$CA_HOST" == "$(hostname -s)" ]]; then
+if [[ "$JOIN_AS_CA" == "true" && "$CA_HOSTNAME" == "$(hostname -s)" ]]; then
   IS_CA_HOST=true
 fi
 
@@ -59,11 +68,14 @@ mkdir -p /home/dev/.hermes/scripts
 mkdir -p /home/dev/certs
 mkdir -p /var/lib/hermes-enroll
 
+# Set the host's avahi name from CA_HOSTNAME so it broadcasts as <CA_HOSTNAME>.local.
+sed -i "s|^host-name=.*|host-name=${CA_HOSTNAME}|" /etc/avahi/avahi-daemon.conf 2>/dev/null || true
+
 if $IS_CA_HOST; then
   if [[ ! -f /root/.step/config/ca.json ]]; then
     openssl rand -base64 32 > /root/.step-pw
     chmod 0600 /root/.step-pw
-    STEPPATH=/root/.step /usr/bin/step ca init --name="AF Resolutions, LLC" \
+    STEPPATH=/root/.step /usr/bin/step ca init --name="${CA_NAME}" \
       --dns="ca.local,localhost,127.0.0.1,${CA_IP}" \
       --address="127.0.0.1:8443" \
       --provisioner="admin" \
@@ -84,32 +96,38 @@ json.dump(d, open(p,'w'), indent=2)
     grep -q "^ca.local" /etc/hosts || echo "127.0.0.1 ca.local" >> /etc/hosts
   fi
 
-  STEPPATH=/root/.step /usr/bin/step ca certificate hermes.local \
-    /etc/traefik/certs/hermes.local.pem \
-    /etc/traefik/certs/hermes.local-key.pem \
+  DASHBOARD_HOSTNAME="${CA_HOSTNAME}.local"
+  STEPPATH=/root/.step /usr/bin/step ca certificate "${DASHBOARD_HOSTNAME}" \
+    /etc/traefik/certs/${CA_HOSTNAME}.local.pem \
+    /etc/traefik/certs/${CA_HOSTNAME}.local-key.pem \
     --provisioner admin \
     --provisioner-password-file /root/.step-pw \
-    --san hermes.local --san "${CA_IP}" --not-after 2160h
+    --san "${DASHBOARD_HOSTNAME}" --san "${CA_IP}" --not-after 2160h
   cp /root/.step/certs/root_ca.crt /etc/traefik/dynamic/root_ca.crt
   cp /root/.step/certs/intermediate_ca.crt /etc/traefik/dynamic/intermediate_ca.crt
+
+  # Substitute CA_HOSTNAME placeholder into the committed configs.
+  sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g; s|<CA_IP>|${CA_IP}|g" \
+    /etc/traefik/dynamic/hermes.yml /etc/traefik/traefik.yml \
+    /etc/systemd/system/hermes-enroll.service /etc/systemd/system/hermes-dashboard.service \
+    /etc/systemd/system/step-ca.service || true
+  mv /etc/systemd/system/hermes-enroll.service "/etc/systemd/system/${CA_HOSTNAME}-enroll.service" 2>/dev/null || true
+  mv /etc/systemd/system/hermes-dashboard.service "/etc/systemd/system/${CA_HOSTNAME}-dashboard.service" 2>/dev/null || true
 fi
 
 if ! $IS_CA_HOST; then
   if [[ ! -f /etc/traefik/dynamic/root_ca.crt ]]; then
-    scp "dev@${CA_HOST}:/root/.step/certs/root_ca.crt" /etc/traefik/dynamic/root_ca.crt
-    scp "dev@${CA_HOST}:/root/.step/certs/intermediate_ca.crt" /etc/traefik/dynamic/intermediate_ca.crt
+    scp "dev@${CA_HOSTNAME}.local:/root/.step/certs/root_ca.crt" /etc/traefik/dynamic/root_ca.crt
+    scp "dev@${CA_HOSTNAME}.local:/root/.step/certs/intermediate_ca.crt" /etc/traefik/dynamic/intermediate_ca.crt
   fi
-fi
 
-install -m 0644 "$REPO_ROOT/etc/systemd/system/step-ca.service" /etc/systemd/system/step-ca.service
-install -m 0644 "$REPO_ROOT/etc/systemd/system/hermes-dashboard.service" /etc/systemd/system/hermes-dashboard.service
-install -m 0644 "$REPO_ROOT/etc/systemd/system/hermes-enroll.service" /etc/systemd/system/hermes-enroll.service
-install -m 0644 "$REPO_ROOT/etc/traefik/traefik.yml" /etc/traefik/traefik.yml
-install -m 0644 "$REPO_ROOT/etc/traefik/dynamic/hermes.yml" /etc/traefik/dynamic/hermes.yml
-install -m 0644 "$REPO_ROOT/etc/avahi/avahi-daemon.conf" /etc/avahi/avahi-daemon.conf
+  sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g; s|<CA_IP>|${CA_IP}|g" \
+    /etc/traefik/dynamic/hermes.yml /etc/traefik/traefik.yml || true
+fi
 
 if [[ ! -f /etc/hermes/acl.json ]]; then
   install -m 0644 "$REPO_ROOT/templates/acl.json" /etc/hermes/acl.json
+  sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" /etc/hermes/acl.json || true
 fi
 
 if [[ ! -f /home/dev/.hermes/scripts/hermes-enroll.js ]]; then
@@ -122,9 +140,7 @@ if [[ ! -d /home/dev/.hermes/scripts/node_modules ]]; then
   npm install hono @hono/node-server >/dev/null 2>&1
 fi
 
-sed -i "s|^host-name=.*|host-name=hermes|" /etc/avahi/avahi-daemon.conf 2>/dev/null || true
-
-cat > /etc/systemd/system/hermes-enroll.service.d/env.conf <<EOF
+cat > /etc/systemd/system/${CA_HOSTNAME}-enroll.service.d/env.conf <<EOF
 [Service]
 Environment=STEPPATH=/root/.step
 Environment=HERMES_HOUSEHOLD_PASSWORD=${HERMES_HOUSEHOLD_PASSWORD}
@@ -136,8 +152,8 @@ systemctl daemon-reload
 if $IS_CA_HOST; then
   systemctl enable --now step-ca
   systemctl enable --now avahi-daemon
-  systemctl enable --now hermes-dashboard
-  systemctl enable --now hermes-enroll
+  systemctl enable --now "${CA_HOSTNAME}-dashboard"
+  systemctl enable --now "${CA_HOSTNAME}-enroll"
   systemctl enable --now traefik
 else
   systemctl enable --now avahi-daemon
@@ -152,7 +168,7 @@ for svc in traefik avahi-daemon; do
   echo "---"
 done
 if $IS_CA_HOST; then
-  for svc in step-ca hermes-dashboard hermes-enroll; do
+  for svc in step-ca "${CA_HOSTNAME}-dashboard" "${CA_HOSTNAME}-enroll"; do
     systemctl --no-pager --full status "$svc" 2>&1 | head -3 || true
     echo "---"
   done
@@ -161,8 +177,8 @@ fi
 echo
 echo "=== Verification ==="
 curl -ksf https://ca.local:8443/health >/dev/null && echo "step-ca: OK" || echo "step-ca: FAIL"
-curl -sf http://127.0.0.1:9120/api/health >/dev/null && echo "hermes-enroll: OK" || echo "hermes-enroll: FAIL"
-curl -k --cacert /etc/traefik/dynamic/root_ca.crt -sf https://hermes.local/api/status >/dev/null && echo "hermes.local (no client cert): unexpectedly OK" || echo "hermes.local: rejects without client cert (expected)"
+curl -sf http://127.0.0.1:9120/api/health >/dev/null && echo "enroll: OK" || echo "enroll: FAIL"
+curl -k --cacert /etc/traefik/dynamic/root_ca.crt -sf https://${CA_HOSTNAME}.local/api/status >/dev/null && echo "${CA_HOSTNAME}.local (no client cert): unexpectedly OK" || echo "${CA_HOSTNAME}.local: rejects without client cert (expected)"
 
 echo
 echo "Bootstrap complete."

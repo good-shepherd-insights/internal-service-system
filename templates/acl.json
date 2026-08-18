@@ -1,4 +1,5 @@
 {
-  "_comment": "Map users to the service hostnames they may access. Edit freely. Traefik validates cert SANs against the connected hostname.",
-  "anthony": ["hermes.local"]
+  "_comment_1": "Map users to the service hostnames they may access. Edit freely. Traefik validates cert SANs against the connected hostname.",
+  "_comment_2": "<CA_HOSTNAME> is replaced at install time with the value of CA_HOSTNAME in .env (e.g. hermes).",
+  "anthony": ["<CA_HOSTNAME>.local"]
 }

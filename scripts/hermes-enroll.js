@@ -1,6 +1,17 @@
 #!/usr/bin/env node
 // Hermes enroll — Hono, dark MercuryLogin-style, decoupled.
 // Single file. No build step. Subprocess to `step` for cert issuance.
+//
+// THIS IS AN EXAMPLE IMPLEMENTATION. The Internal Service System design
+// (see README.md) does not require Hono. To use a different framework, replace
+// this file with your own implementation of these routes:
+//   GET  /         — serve your enroll page
+//   POST /api/enroll — accept {name, password}, call `step ca certificate ...` (see code below)
+// The design's two contracts:
+//   1. The .p12 returned MUST bundle cert + intermediate so the chain validates
+//      against Traefik's caFiles.
+//   2. The cert MUST have `--provisioner-password-file /root/.step-pw` so step-ca
+//      can decrypt the admin JWK.
 
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';

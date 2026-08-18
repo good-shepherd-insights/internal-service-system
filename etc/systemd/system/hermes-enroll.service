@@ -1,0 +1,17 @@
+[Unit]
+Description=Hermes Client Cert Enrollment (Hono)
+After=step-ca.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/dev/.hermes/scripts
+ExecStart=/home/dev/.local/bin/node /home/dev/.hermes/scripts/hermes-enroll.js
+Environment=HERMES_HOUSEHOLD_PASSWORD=test123
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

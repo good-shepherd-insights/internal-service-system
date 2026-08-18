@@ -1,0 +1,4 @@
+{
+  "_comment": "Map users to the service hostnames they may access. Edit freely. Traefik validates cert SANs against the connected hostname.",
+  "anthony": ["hermes.local"]
+}

@@ -124,17 +124,19 @@ for f in /etc/traefik/dynamic/hermes.yml /etc/traefik/traefik.yml; do
 done
 
 # Rename service units from the example `hermes-*` names to the operator's
-# brand. Idempotent: skip if target exists.
+# brand. Idempotent: skip if target exists. Also sed-substitute any hardcoded
+# `hermes-enroll.js` references in ExecStart lines so the renamed unit points
+# at the renamed script.
 if $IS_CA_HOST; then
-  for base in enroll dashboard; do
-    src="/etc/systemd/system/hermes-${base}.service"
-    dst="/etc/systemd/system/${CA_HOSTNAME}-${base}.service"
-    if [[ -f "$src" && ! -f "$dst" ]]; then
-      mv "$src" "$dst"
-    elif [[ -f "$src" && -f "$dst" ]]; then
-      rm -f "$src"
-    fi
-  done
+  src="/etc/systemd/system/hermes-enroll.service"
+  dst="/etc/systemd/system/${CA_HOSTNAME}-enroll.service"
+  if [[ -f "$src" && ! -f "$dst" ]]; then
+    sed -i "s|Description=.*|Description=${CA_HOSTNAME} cert enrollment|" "$src"
+    sed -i "s|hermes-enroll\\.service|${CA_HOSTNAME}-enroll.service|g; s|hermes-enroll\\.js|${CA_HOSTNAME}-enroll.js|g" "$src"
+    mv "$src" "$dst"
+  elif [[ -f "$src" && -f "$dst" ]]; then
+    rm -f "$src"
+  fi
 fi
 
 if [[ ! -f /etc/hermes/acl.json ]]; then
@@ -142,8 +144,11 @@ if [[ ! -f /etc/hermes/acl.json ]]; then
 fi
 sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" /etc/hermes/acl.json 2>/dev/null || true
 
-if [[ ! -f /home/dev/.hermes/scripts/hermes-enroll.js ]]; then
-  install -m 0755 "$REPO_ROOT/scripts/hermes-enroll.js" /home/dev/.hermes/scripts/hermes-enroll.js
+SCRIPT_DIR=/home/dev/.hermes/scripts
+src_js="$REPO_ROOT/scripts/hermes-enroll.js"
+dst_js="$SCRIPT_DIR/${CA_HOSTNAME}-enroll.js"
+if [[ ! -f "$dst_js" && -f "$src_js" ]]; then
+  install -m 0755 "$src_js" "$dst_js"
 fi
 
 if [[ ! -d /home/dev/.hermes/scripts/node_modules ]]; then

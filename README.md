@@ -46,6 +46,8 @@ cp .env.example .env   # edit CA_HOSTNAME, CA_NAME, CA_IP, JOIN_AS_CA, ENROLL_HO
 sudo ./bootstrap.sh
 ```
 
+Requires Ubuntu 26.04+ (OpenSSL 3.5+). The bootstrap will refuse to run on older hosts.
+
 The bootstrap:
 - Installs packages, downloads step-ca/step-cli/traefik from GitHub releases
 - On the CA host: generates the CA, configures ACL+CRL, issues the dashboard's server cert
@@ -90,7 +92,8 @@ After the mesh is up:
 
 ## Caveats
 
+- **OpenSSL ≥ 3.5 required.** step-cli 0.30.x's cert verification needs OpenSSL 3.5 or newer. Ubuntu 24.04 ships with 3.0; the bootstrap will refuse to run on older hosts. Tested on Ubuntu 26.04.
 - mDNS scope is one LAN/VLAN. Cross-VLAN service discovery needs real DNS or a reflector.
-- The CA host's `/home/dev/.hermes/config.yaml` (basic auth) is operator's responsibility, not in this repo.
+- The dashboard at port 9119 is operator's responsibility. The bootstrap only configures the Traefik router for it.
 - Re-enrolling an existing user requires deleting `/var/lib/hermes-enroll/issued.json` on the CA host first.
-- Each unit file in `etc/systemd/system/` is keyed to the example names (`hermes-*`). When you rebrand, rename the files and update the unit's `ExecStart` paths and `Description` lines.
+- Each unit file in `etc/systemd/system/` is keyed to example names (`hermes-*`). Bootstrap renames them based on `.env`.

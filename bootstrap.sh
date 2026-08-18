@@ -33,6 +33,24 @@ source "$REPO_ROOT/.env"
 : "${DASHBOARD_PORT:=9119}"
 : "${ENROLL_PORT:=9120}"
 
+# step-cli 0.30.x requires OpenSSL >= 3.5 for chain validation to work with
+# its --root flag. Ubuntu 24.04 ships with 3.0 which causes cert verify
+# failures. Refuse to continue on too-old OpenSSL.
+_OPENSSL_VERSION=$(openssl version | awk '{print $2}')
+_OPENSSL_MAJOR=$(echo "$_OPENSSL_VERSION" | cut -d. -f1)
+_OPENSSL_MINOR=$(echo "$_OPENSSL_VERSION" | cut -d. -f2)
+if [[ "$_OPENSSL_MAJOR" -lt 3 || ("$_OPENSSL_MAJOR" -eq 3 && "$_OPENSSL_MINOR" -lt 5) ]]; then
+  echo "FATAL: OpenSSL $_OPENSSL_VERSION is too old. step-cli 0.30.x needs >= 3.5." >&2
+  echo "Use Ubuntu 26.04 or newer, or install OpenSSL 3.5+ from source." >&2
+  exit 1
+fi
+
+# Validate inputs.
+if [[ ! "$CA_HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+  echo "CA_HOSTNAME must be a single label (lowercase, digits, hyphens; no leading/trailing hyphen)." >&2
+  exit 1
+fi
+
 IS_CA_HOST=false
 if [[ "$JOIN_AS_CA" == "true" && "$CA_HOSTNAME" == "$(hostname -s)" ]]; then
   IS_CA_HOST=true
@@ -47,12 +65,13 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 if ! command -v step >/dev/null 2>&1; then
-  STEP_CLI_VERSION=0.30.6
-  STEP_CA_VERSION=0.30.2
+  # Pin to a version known to verify step-ca's cert with --root correctly.
+  STEP_CLI_VERSION=0.30.5
+  STEP_CA_VERSION=0.30.1
   cd /tmp
-  wget -q "https://github.com/smallstep/cli/releases/download/v${STEP_CLI_VERSION}/step-cli_${STEP_CLI_VERSION}_amd64.deb"
-  wget -q "https://github.com/smallstep/certificates/releases/download/v${STEP_CA_VERSION}/step-ca_${STEP_CA_VERSION}_amd64.deb"
-  apt-get install -y "./step-cli_${STEP_CLI_VERSION}_amd64.deb" "./step-ca_${STEP_CA_VERSION}_amd64.deb"
+  wget -q "https://github.com/smallstep/cli/releases/download/v${STEP_CLI_VERSION}/step-cli_${STEP_CLI_VERSION}-1_amd64.deb"
+  wget -q "https://github.com/smallstep/certificates/releases/download/v${STEP_CA_VERSION}/step-ca_${STEP_CA_VERSION}-1_amd64.deb"
+  apt-get install -y "./step-cli_${STEP_CLI_VERSION}-1_amd64.deb" "./step-ca_${STEP_CA_VERSION}-1_amd64.deb"
   rm -f /tmp/step-cli_*.deb /tmp/step-ca_*.deb
 fi
 
@@ -93,10 +112,26 @@ d['authority']['claims']['maxTLSCertDuration']='8760h0m0s'
 d['authority']['claims']['defaultTLSCertDuration']='8760h0m0s'
 json.dump(d, open(p,'w'), indent=2)
 "
+    grep -q "^ca.local" /etc/hosts || echo "127.0.0.1 ca.local" >> /etc/hosts
+  fi
+
+  # Install the step-ca service unit (idempotent) so we can talk to the daemon.
+  install -m 0644 "$REPO_ROOT/etc/systemd/system/step-ca.service" /etc/systemd/system/step-ca.service
+  systemctl daemon-reload
+  systemctl enable --now step-ca
+
+  # Wait for step-ca to be reachable.
+  for _ in $(seq 1 30); do
+    if curl -ksf https://ca.local:8443/health >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ ! -f /etc/traefik/dynamic/root_ca.crt ]]; then
     STEPPATH=/root/.step /usr/bin/step ca provisioner add acme --type ACME \
       --ca-url https://ca.local:8443 --root /root/.step/certs/root_ca.crt \
       --password-file /root/.step-pw
-    grep -q "^ca.local" /etc/hosts || echo "127.0.0.1 ca.local" >> /etc/hosts
   fi
 
   DASHBOARD_HOSTNAME="${CA_HOSTNAME}.local"
@@ -109,6 +144,9 @@ json.dump(d, open(p,'w'), indent=2)
   cp /root/.step/certs/root_ca.crt /etc/traefik/dynamic/root_ca.crt
   cp /root/.step/certs/intermediate_ca.crt /etc/traefik/dynamic/intermediate_ca.crt
 fi
+
+# Idempotent: skip the step-ca systemctl in the loop below if we're CA host.
+SKIP_STEPCA_ENABLE=$IS_CA_HOST
 
 if ! $IS_CA_HOST; then
   if [[ ! -f /etc/traefik/dynamic/root_ca.crt ]]; then
@@ -133,6 +171,7 @@ install -m 0644 "$REPO_ROOT/etc/avahi/avahi-daemon.conf" /etc/avahi/avahi-daemon
 
 # Install systemd units.
 install -m 0644 "$REPO_ROOT/etc/systemd/system/step-ca.service" /etc/systemd/system/step-ca.service
+install -m 0644 "$REPO_ROOT/etc/systemd/system/traefik.service" /etc/systemd/system/traefik.service
 
 # Rename the enroll service unit to the operator's brand, substituting its
 # ExecStart and Description so it actually runs after the rename.
@@ -183,7 +222,6 @@ EOF
 systemctl daemon-reload
 
 if $IS_CA_HOST; then
-  systemctl enable --now step-ca
   systemctl enable --now avahi-daemon
   systemctl enable --now "${CA_HOSTNAME}-enroll"
   systemctl enable --now traefik

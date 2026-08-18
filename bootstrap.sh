@@ -105,30 +105,42 @@ json.dump(d, open(p,'w'), indent=2)
     --san "${DASHBOARD_HOSTNAME}" --san "${CA_IP}" --not-after 2160h
   cp /root/.step/certs/root_ca.crt /etc/traefik/dynamic/root_ca.crt
   cp /root/.step/certs/intermediate_ca.crt /etc/traefik/dynamic/intermediate_ca.crt
-
-  # Substitute CA_HOSTNAME placeholder into the committed configs.
-  sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g; s|<CA_IP>|${CA_IP}|g" \
-    /etc/traefik/dynamic/hermes.yml /etc/traefik/traefik.yml \
-    /etc/systemd/system/hermes-enroll.service /etc/systemd/system/hermes-dashboard.service \
-    /etc/systemd/system/step-ca.service || true
-  mv /etc/systemd/system/hermes-enroll.service "/etc/systemd/system/${CA_HOSTNAME}-enroll.service" 2>/dev/null || true
-  mv /etc/systemd/system/hermes-dashboard.service "/etc/systemd/system/${CA_HOSTNAME}-dashboard.service" 2>/dev/null || true
 fi
 
+# On a join host, scp from the CA host by IP (not by <CA_HOSTNAME>.local,
+# because avahi may not be broadcasting yet when this runs).
 if ! $IS_CA_HOST; then
   if [[ ! -f /etc/traefik/dynamic/root_ca.crt ]]; then
-    scp "dev@${CA_HOSTNAME}.local:/root/.step/certs/root_ca.crt" /etc/traefik/dynamic/root_ca.crt
-    scp "dev@${CA_HOSTNAME}.local:/root/.step/certs/intermediate_ca.crt" /etc/traefik/dynamic/intermediate_ca.crt
+    scp "dev@${CA_IP}:/root/.step/certs/root_ca.crt" /etc/traefik/dynamic/root_ca.crt
+    scp "dev@${CA_IP}:/root/.step/certs/intermediate_ca.crt" /etc/traefik/dynamic/intermediate_ca.crt
   fi
+fi
 
-  sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g; s|<CA_IP>|${CA_IP}|g" \
-    /etc/traefik/dynamic/hermes.yml /etc/traefik/traefik.yml || true
+# Substitute literal `hermes` placeholders in the committed configs.
+for f in /etc/traefik/dynamic/hermes.yml /etc/traefik/traefik.yml; do
+  if [[ -f "$f" ]]; then
+    sed -i "s|hermes\.local|${CA_HOSTNAME}.local|g" "$f" || true
+  fi
+done
+
+# Rename service units from the example `hermes-*` names to the operator's
+# brand. Idempotent: skip if target exists.
+if $IS_CA_HOST; then
+  for base in enroll dashboard; do
+    src="/etc/systemd/system/hermes-${base}.service"
+    dst="/etc/systemd/system/${CA_HOSTNAME}-${base}.service"
+    if [[ -f "$src" && ! -f "$dst" ]]; then
+      mv "$src" "$dst"
+    elif [[ -f "$src" && -f "$dst" ]]; then
+      rm -f "$src"
+    fi
+  done
 fi
 
 if [[ ! -f /etc/hermes/acl.json ]]; then
   install -m 0644 "$REPO_ROOT/templates/acl.json" /etc/hermes/acl.json
-  sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" /etc/hermes/acl.json || true
 fi
+sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" /etc/hermes/acl.json 2>/dev/null || true
 
 if [[ ! -f /home/dev/.hermes/scripts/hermes-enroll.js ]]; then
   install -m 0755 "$REPO_ROOT/scripts/hermes-enroll.js" /home/dev/.hermes/scripts/hermes-enroll.js

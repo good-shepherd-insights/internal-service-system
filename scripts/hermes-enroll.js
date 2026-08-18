@@ -22,12 +22,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const execFileP = promisify(execFile);
-const PORT = 9120;
-const HOUSEHOLD_PASSWORD = process.env.HERMES_HOUSEHOLD_PASSWORD;
+const PORT = process.env.ENROLL_PORT || 9120;
+const HOUSEHOLD_PASSWORD = process.env.ENROLL_HOUSEHOLD_PASSWORD;
 const STEP = '/usr/bin/step';
 
 if (!HOUSEHOLD_PASSWORD) {
-  console.error('HERMES_HOUSEHOLD_PASSWORD env var is required');
+  console.error('ENROLL_HOUSEHOLD_PASSWORD env var is required');
   process.exit(1);
 }
 
@@ -377,7 +377,7 @@ app.post('/api/enroll', async (c) => {
       certPath, keyPath,
       '--provisioner', 'admin',
       '--san', `${name}.local`,
-      '--san', '192.168.1.152',
+      '--san', process.env.CA_IP || `<CA_IP>`,
       '--not-after', '2160h',
       '--provisioner-password-file', '/root/.step-pw',
     ], {
@@ -395,7 +395,7 @@ app.post('/api/enroll', async (c) => {
       '-inkey', keyPath,
       '-in', certPath,
       '-certfile', chainPath,
-      '-password', `pass:${process.env.HERMES_P12_PASSWORD || 'hermes'}`,
+      '-password', `pass:${process.env.ENROLL_P12_PASSWORD || 'hermes'}`,
       '-name', name,
     ]);
 

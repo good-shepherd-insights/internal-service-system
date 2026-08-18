@@ -3,12 +3,14 @@
 # Idempotent. Re-running on a configured host is safe.
 #
 # Variables come from .env (see .env.example):
-#   CA_HOSTNAME   - mDNS hostname of the CA host (also daemons's host-name)
-#   CA_NAME       - CA cert subject O
-#   CA_IP         - CA host's LAN IP
-#   JOIN_AS_CA    - true on CA host, false on join hosts
-#   HERMES_HOUSEHOLD_PASSWORD - shared password for the enroll page
-#   HERMES_P12_PASSWORD - .p12 install password
+#   CA_HOSTNAME         - mDNS hostname of the CA host (also daemons's host-name)
+#   CA_NAME             - CA cert subject O
+#   CA_IP               - CA host's LAN IP
+#   JOIN_AS_CA          - true on CA host, false on join hosts
+#   ENROLL_HOUSEHOLD_PASSWORD - shared password for the enroll page
+#   ENROLL_P12_PASSWORD  - .p12 install password
+#   DASHBOARD_PORT      - port the operator's dashboard listens on (default 9119)
+#   ENROLL_PORT         - port the enroll app listens on (default 9120)
 
 set -euo pipefail
 trap 'echo "BOOTSTRAP FAILED at line $LINENO" >&2' ERR
@@ -25,9 +27,11 @@ source "$REPO_ROOT/.env"
 : "${CA_HOSTNAME:?must be set}"
 : "${CA_NAME:?must be set}"
 : "${CA_IP:?must be set}"
-: "${HERMES_HOUSEHOLD_PASSWORD:?must be set}"
-: "${HERMES_P12_PASSWORD:?must be set}"
+: "${ENROLL_HOUSEHOLD_PASSWORD:?must be set}"
+: "${ENROLL_P12_PASSWORD:?must be set}"
 : "${JOIN_AS_CA:=true}"
+: "${DASHBOARD_PORT:=9119}"
+: "${ENROLL_PORT:=9120}"
 
 IS_CA_HOST=false
 if [[ "$JOIN_AS_CA" == "true" && "$CA_HOSTNAME" == "$(hostname -s)" ]]; then
@@ -65,7 +69,6 @@ mkdir -p /etc/traefik/dynamic
 mkdir -p /etc/traefik/certs
 mkdir -p /etc/hermes
 mkdir -p /home/dev/.hermes/scripts
-mkdir -p /home/dev/certs
 mkdir -p /var/lib/hermes-enroll
 
 # Set the host's avahi name from CA_HOSTNAME so it broadcasts as <CA_HOSTNAME>.local.
@@ -107,8 +110,6 @@ json.dump(d, open(p,'w'), indent=2)
   cp /root/.step/certs/intermediate_ca.crt /etc/traefik/dynamic/intermediate_ca.crt
 fi
 
-# On a join host, scp from the CA host by IP (not by <CA_HOSTNAME>.local,
-# because avahi may not be broadcasting yet when this runs).
 if ! $IS_CA_HOST; then
   if [[ ! -f /etc/traefik/dynamic/root_ca.crt ]]; then
     scp "dev@${CA_IP}:/root/.step/certs/root_ca.crt" /etc/traefik/dynamic/root_ca.crt
@@ -116,34 +117,45 @@ if ! $IS_CA_HOST; then
   fi
 fi
 
-# Substitute literal `hermes` placeholders in the committed configs.
-for f in /etc/traefik/dynamic/hermes.yml /etc/traefik/traefik.yml; do
-  if [[ -f "$f" ]]; then
-    sed -i "s|hermes\.local|${CA_HOSTNAME}.local|g" "$f" || true
-  fi
-done
+# Install Traefik configs.
+install -m 0644 "$REPO_ROOT/etc/traefik/traefik.yml" /etc/traefik/traefik.yml
+install -m 0644 "$REPO_ROOT/etc/traefik/dynamic/hermes.yml" /etc/traefik/dynamic/hermes.yml
 
-# Rename service units from the example `hermes-*` names to the operator's
-# brand. Idempotent: skip if target exists. Also sed-substitute any hardcoded
-# `hermes-enroll.js` references in ExecStart lines so the renamed unit points
-# at the renamed script.
-if $IS_CA_HOST; then
+# Substitute placeholders in Traefik dynamic config (only file with placeholders).
+sed -i \
+  -e "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" \
+  -e "s|<DASHBOARD_PORT>|${DASHBOARD_PORT}|g" \
+  -e "s|<ENROLL_PORT>|${ENROLL_PORT}|g" \
+  /etc/traefik/dynamic/hermes.yml
+
+# Install avahi config.
+install -m 0644 "$REPO_ROOT/etc/avahi/avahi-daemon.conf" /etc/avahi/avahi-daemon.conf
+
+# Install systemd units.
+install -m 0644 "$REPO_ROOT/etc/systemd/system/step-ca.service" /etc/systemd/system/step-ca.service
+
+# Rename the enroll service unit to the operator's brand, substituting its
+# ExecStart and Description so it actually runs after the rename.
+if [[ -f "$REPO_ROOT/etc/systemd/system/hermes-enroll.service" ]]; then
   src="/etc/systemd/system/hermes-enroll.service"
   dst="/etc/systemd/system/${CA_HOSTNAME}-enroll.service"
-  if [[ -f "$src" && ! -f "$dst" ]]; then
-    sed -i "s|Description=.*|Description=${CA_HOSTNAME} cert enrollment|" "$src"
-    sed -i "s|hermes-enroll\\.service|${CA_HOSTNAME}-enroll.service|g; s|hermes-enroll\\.js|${CA_HOSTNAME}-enroll.js|g" "$src"
+  if [[ ! -f "$dst" ]]; then
+    install -m 0644 "$REPO_ROOT/etc/systemd/system/hermes-enroll.service" "$src"
+    sed -i \
+      -e "s|Description=.*|Description=${CA_HOSTNAME} cert enrollment|" \
+      -e "s|/home/dev/.hermes/scripts/hermes-enroll\\.js|/home/dev/.hermes/scripts/${CA_HOSTNAME}-enroll.js|" \
+      "$src"
     mv "$src" "$dst"
-  elif [[ -f "$src" && -f "$dst" ]]; then
-    rm -f "$src"
   fi
 fi
 
+# Install templates with placeholder substitution.
 if [[ ! -f /etc/hermes/acl.json ]]; then
   install -m 0644 "$REPO_ROOT/templates/acl.json" /etc/hermes/acl.json
 fi
-sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" /etc/hermes/acl.json 2>/dev/null || true
+sed -i "s|<CA_HOSTNAME>|${CA_HOSTNAME}|g" /etc/hermes/acl.json
 
+# Install the enroll app JS, renamed to the operator's brand.
 SCRIPT_DIR=/home/dev/.hermes/scripts
 src_js="$REPO_ROOT/scripts/hermes-enroll.js"
 dst_js="$SCRIPT_DIR/${CA_HOSTNAME}-enroll.js"
@@ -151,17 +163,21 @@ if [[ ! -f "$dst_js" && -f "$src_js" ]]; then
   install -m 0755 "$src_js" "$dst_js"
 fi
 
-if [[ ! -d /home/dev/.hermes/scripts/node_modules ]]; then
-  cd /home/dev/.hermes/scripts
+if [[ ! -d "$SCRIPT_DIR/node_modules" ]]; then
+  cd "$SCRIPT_DIR"
   npm init -y >/dev/null 2>&1
   npm install hono @hono/node-server >/dev/null 2>&1
 fi
 
-cat > /etc/systemd/system/${CA_HOSTNAME}-enroll.service.d/env.conf <<EOF
+# Drop-in for env vars. NEVER commit these to the unit file.
+mkdir -p "/etc/systemd/system/${CA_HOSTNAME}-enroll.service.d"
+cat > "/etc/systemd/system/${CA_HOSTNAME}-enroll.service.d/env.conf" <<EOF
 [Service]
 Environment=STEPPATH=/root/.step
-Environment=HERMES_HOUSEHOLD_PASSWORD=${HERMES_HOUSEHOLD_PASSWORD}
-Environment=HERMES_P12_PASSWORD=${HERMES_P12_PASSWORD}
+Environment=ENROLL_HOUSEHOLD_PASSWORD=${ENROLL_HOUSEHOLD_PASSWORD}
+Environment=ENROLL_P12_PASSWORD=${ENROLL_P12_PASSWORD}
+Environment=ENROLL_PORT=${ENROLL_PORT}
+Environment=CA_IP=${CA_IP}
 EOF
 
 systemctl daemon-reload
@@ -169,7 +185,6 @@ systemctl daemon-reload
 if $IS_CA_HOST; then
   systemctl enable --now step-ca
   systemctl enable --now avahi-daemon
-  systemctl enable --now "${CA_HOSTNAME}-dashboard"
   systemctl enable --now "${CA_HOSTNAME}-enroll"
   systemctl enable --now traefik
 else
@@ -185,7 +200,7 @@ for svc in traefik avahi-daemon; do
   echo "---"
 done
 if $IS_CA_HOST; then
-  for svc in step-ca "${CA_HOSTNAME}-dashboard" "${CA_HOSTNAME}-enroll"; do
+  for svc in step-ca "${CA_HOSTNAME}-enroll"; do
     systemctl --no-pager --full status "$svc" 2>&1 | head -3 || true
     echo "---"
   done
@@ -194,8 +209,7 @@ fi
 echo
 echo "=== Verification ==="
 curl -ksf https://ca.local:8443/health >/dev/null && echo "step-ca: OK" || echo "step-ca: FAIL"
-curl -sf http://127.0.0.1:9120/api/health >/dev/null && echo "enroll: OK" || echo "enroll: FAIL"
-curl -k --cacert /etc/traefik/dynamic/root_ca.crt -sf https://${CA_HOSTNAME}.local/api/status >/dev/null && echo "${CA_HOSTNAME}.local (no client cert): unexpectedly OK" || echo "${CA_HOSTNAME}.local: rejects without client cert (expected)"
+curl -sf "http://127.0.0.1:${ENROLL_PORT}/api/health" >/dev/null && echo "enroll: OK" || echo "enroll: FAIL"
 
 echo
 echo "Bootstrap complete."

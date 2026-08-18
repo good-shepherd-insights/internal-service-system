@@ -27,23 +27,22 @@ Pick your own brand on install. Update `.env` and the script will pick up your v
 | `CA_HOSTNAME` | `hermes` | mDNS name of the CA host (`hermes.local`). Default in this repo. |
 | `CA_NAME` | `AF Resolutions, LLC` | The cert subject O of the CA. Appears in every issued cert. |
 | `CA_IP` | `192.168.1.152` | The CA host's LAN IP. Used in cert SANs. |
-| `DASHBOARD_HOSTNAME` | `hermes.local` | URL the operator-facing dashboard is reachable at. mTLS protected. |
-| `ENROLL_HOSTNAME` | `enroll.local` | URL users hit to get their cert. Plain HTTP. |
-| `HERMES_HOUSEHOLD_PASSWORD` | (your secret) | Shared password users enter at the enroll page. |
-| `HERMES_P12_PASSWORD` | `hermes` | Password the .p12 file is encrypted with. Mac users type this on import. |
+| `DASHBOARD_PORT` | `9119` | Port the operator's dashboard listens on. The Traefik router renders this as the backend. |
+| `ENROLL_PORT` | `9120` | Port the Hono enroll app listens on (this template). |
+| `ENROLL_HOUSEHOLD_PASSWORD` | (your secret) | Shared password users enter at the enroll page. |
+| `ENROLL_P12_PASSWORD` | `hermes` | Password the .p12 file is encrypted with. Mac users type this on import. |
 
 If you fork this repo and want to rebrand entirely, also:
-- Rename service unit filenames: `hermes-enroll.service` → `<your-svc>-enroll.service`
-- Rename the dashboard file: `scripts/hermes-enroll.js` → `scripts/<your-svc>-enroll.js`
+- Rename service unit filenames. Bootstrap does this automatically on install — the committed `hermes-enroll.service` becomes `${CA_HOSTNAME}-enroll.service` based on `.env`.
 - Replace the Hono enroll app with your own implementation. The design doesn't require Hono; any Node/Go/Python server with the same `/api/enroll` shape works.
-- Replace the dashboard module with your own.
+- Replace the dashboard module with your own. The template ships an empty `<DASHBOARD_PORT>` slot — operators fill it in.
 
 ## Quickstart
 
 ```bash
 git clone https://github.com/good-shepherd-insights/internal-service-system.git
 cd internal-service-system
-cp .env.example .env   # edit CA_HOSTNAME, CA_NAME, CA_IP, JOIN_AS_CA, HERMES_HOUSEHOLD_PASSWORD, HERMES_P12_PASSWORD
+cp .env.example .env   # edit CA_HOSTNAME, CA_NAME, CA_IP, JOIN_AS_CA, ENROLL_HOUSEHOLD_PASSWORD, ENROLL_P12_PASSWORD
 sudo ./bootstrap.sh
 ```
 
@@ -82,11 +81,11 @@ After the mesh is up:
 │   ├── traefik/              — Traefik static + dynamic configs
 │   └── avahi/                — mDNS daemon config
 ├── scripts/
-│   └── hermes-enroll.js      — Hono enroll app. Example implementation.
+│   └── hermes-enroll.js      — Hono enroll app. Example implementation. Renamed to <CA_HOSTNAME>-enroll.js by bootstrap.
 ├── templates/
 │   └── acl.json              — user → service hostnames map (template)
 └── docs/
-    └── skill.md              — full operator spec for the live system
+    └── design.md             — full design specification (brand-agnostic)
 ```
 
 ## Caveats

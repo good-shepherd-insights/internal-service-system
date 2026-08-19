@@ -17,11 +17,6 @@ http:
       service: dashboard-svc
       tls:
         options: mtls
-    enroll:
-      rule: "Host(`<CA_HOSTNAME>.local`) && PathPrefix(`/enroll`)"
-      entryPoints: [websecure]
-      service: enroll-svc
-      tls: {}
     redirect-https:
       rule: "Host(`<CA_HOSTNAME>.local`)"
       entryPoints: [web]
@@ -38,13 +33,8 @@ http:
         passHostHeader: false
         servers:
           - url: "http://127.0.0.1:<DASHBOARD_PORT>"
-    enroll-svc:
-      loadBalancer:
-        passHostHeader: true
-        servers:
-          - url: "http://127.0.0.1:<ENROLL_PORT>"
     dummy:
       loadBalancer:
         passHostHeader: false
         servers:
-          - url: "http://127.0.0.1:1"
+          - url: "http://127.0.0.1:65535"

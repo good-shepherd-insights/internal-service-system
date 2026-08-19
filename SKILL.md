@@ -156,8 +156,8 @@ The user opens `http://<CA_HOSTNAME>.local`, types their name + the household pa
 
 ## What the operator wants to know
 
-- The enroll page is at `http://<CA_HOSTNAME>.local` (plain HTTP — no TLS).
-- The mTLS-gated services are at `https://<CA_HOSTNAME>.local` and `https://<CA_HOSTNAME>.local/enroll/...`.
+- The mTLS-gated dashboard is at `https://<CA_HOSTNAME>.local`.
+- The enroll app listens on `127.0.0.1:<ENROLL_PORT>` but is not routed by the template's Traefik config. Operators add their own router in `iss.yml` (see "Adding a service") or expose it directly on a separate hostname.
 - The user-visible enroll page says whatever `ISS_NAME` is in `.env`. Pick a short brand.
 - The cert issuer's O is `CA_NAME`. Operator picks the legal name (e.g. their LLC).
 - The mDNS hostname is `<CA_HOSTNAME>.local`. Operator picks a single label.

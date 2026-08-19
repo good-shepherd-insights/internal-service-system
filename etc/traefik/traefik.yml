@@ -5,7 +5,7 @@ entryPoints:
     address: ":443"
 providers:
   file:
-    directory: /etc/iss/dynamic
+    directory: <ISS_CONFIG_DIR>/dynamic
     watch: true
 log:
   level: INFO

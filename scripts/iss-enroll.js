@@ -24,28 +24,26 @@ import { join } from 'node:path';
 const execFileP = promisify(execFile);
 const STEP = '/usr/bin/step';
 
-const ISS_CONFIG_DIR = process.env.ISS_CONFIG_DIR || '/etc/iss';
-const ISS_STATE_DIR = process.env.ISS_STATE_DIR || '/var/lib/iss';
-const ISS_NAME = process.env.ISS_NAME || 'ISS';
-const CA_NAME = process.env.CA_NAME || '<CA_NAME>';
-const CA_HOSTNAME = process.env.CA_HOSTNAME || 'ca';
-const CA_IP = process.env.CA_IP;
-const PORT = parseInt(process.env.ENROLL_PORT || '8081', 10);
-const HOUSEHOLD_PASSWORD = process.env.ENROLL_HOUSEHOLD_PASSWORD;
-const P12_PASSWORD = process.env.ENROLL_P12_PASSWORD;
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) {
+    console.error(`${name} env var is required`);
+    process.exit(1);
+  }
+  return v;
+}
 
-if (!HOUSEHOLD_PASSWORD) {
-  console.error('ENROLL_HOUSEHOLD_PASSWORD env var is required');
-  process.exit(1);
-}
-if (!P12_PASSWORD) {
-  console.error('ENROLL_P12_PASSWORD env var is required');
-  process.exit(1);
-}
-if (!CA_IP) {
-  console.error('CA_IP env var is required');
-  process.exit(1);
-}
+const ISS_CONFIG_DIR = requireEnv('ISS_CONFIG_DIR');
+const ISS_STATE_DIR = requireEnv('ISS_STATE_DIR');
+const ISS_NAME = requireEnv('ISS_NAME');
+const CA_NAME = requireEnv('CA_NAME');
+const CA_HOSTNAME = requireEnv('CA_HOSTNAME');
+const CA_IP = requireEnv('CA_IP');
+const PORT = parseInt(requireEnv('ENROLL_PORT'), 10);
+const HOUSEHOLD_PASSWORD = requireEnv('ENROLL_HOUSEHOLD_PASSWORD');
+const P12_PASSWORD = requireEnv('ENROLL_P12_PASSWORD');
+const STEPPATH = requireEnv('STEPPATH');
+const STEPPATH_FILE = process.env.STEPPATH_FILE || `${STEPPATH}-pw`;
 
 const ACL_PATH = `${ISS_CONFIG_DIR}/acl.json`;
 const ISSUED_PATH = `${ISS_STATE_DIR}/enroll/issued.json`;
@@ -224,14 +222,14 @@ app.post('/api/enroll', async (c) => {
       'ca', 'certificate', name,
       certPath, keyPath,
       '--provisioner', 'admin',
-      '--provisioner-password-file', '/root/.step-pw',
+      '--provisioner-password-file', STEPPATH_FILE,
       '--san', ...allowed,
       '--san', CA_IP,
       '--not-after', '2160h',
-    ], { env: { ...process.env, STEPPATH: '/root/.step' } });
+    ], { env: { ...process.env, STEPPATH } });
 
     const certPEM = await readFile(certPath, 'utf8');
-    const intermediatePEM = await readFile('/root/.step/certs/intermediate_ca.crt', 'utf8');
+    const intermediatePEM = await readFile(`${ISS_CONFIG_DIR}/dynamic/intermediate_ca.crt`, 'utf8');
     const chainPath = join(tmp, 'chain.pem');
     await writeFile(chainPath, certPEM + '\n' + intermediatePEM);
 

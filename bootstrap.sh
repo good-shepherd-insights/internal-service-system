@@ -165,12 +165,14 @@ PYEOF
     --ca-url https://ca.local:8443 --root /root/.step/certs/root_ca.crt \
     --password-file /root/.step-pw || true
 
-  # Issue the CA host's server cert.
-  STEPPATH=/root/.step /usr/bin/step ca certificate "${CA_HOSTNAME}.local" \
-    "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local.pem" \
-    "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local-key.pem" \
-    --provisioner admin --provisioner-password-file /root/.step-pw \
-    --san "${CA_HOSTNAME}.local" --san "${CA_IP}" --not-after 2160h
+  # Issue the CA host's server cert (skip if already issued).
+  if [[ ! -f "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local.pem" ]]; then
+    STEPPATH=/root/.step /usr/bin/step ca certificate "${CA_HOSTNAME}.local" \
+      "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local.pem" \
+      "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local-key.pem" \
+      --provisioner admin --provisioner-password-file /root/.step-pw \
+      --san "${CA_HOSTNAME}.local" --san "${CA_IP}" --not-after 2160h
+  fi
 
   cp /root/.step/certs/root_ca.crt "$ISS_CONFIG_DIR/dynamic/root_ca.crt"
   cp /root/.step/certs/intermediate_ca.crt "$ISS_CONFIG_DIR/dynamic/intermediate_ca.crt"
@@ -179,6 +181,9 @@ fi
 # Traefik configs (used on both CA and join hosts).
 install -m 0644 "$REPO_ROOT/etc/traefik/traefik.yml" /etc/traefik/traefik.yml
 install -m 0644 "$REPO_ROOT/etc/traefik/dynamic/iss.yml" "$ISS_CONFIG_DIR/dynamic/iss.yml"
+
+# Substitute placeholders in Traefik static config.
+sed -i -e "s|<ISS_CONFIG_DIR>|${ISS_CONFIG_DIR}|g" /etc/traefik/traefik.yml
 
 # Substitute placeholders in the dynamic config.
 sed -i \
@@ -241,6 +246,7 @@ if $IS_CA_HOST; then
   cat > "/etc/systemd/system/${CA_HOSTNAME}-enroll.service.d/env.conf" <<EOF
 [Service]
 Environment=STEPPATH=/root/.step
+Environment=STEPPATH_FILE=/root/.step-pw
 Environment=ISS_STATE_DIR=${ISS_STATE_DIR}
 Environment=ISS_CONFIG_DIR=${ISS_CONFIG_DIR}
 Environment=CA_HOSTNAME=${CA_HOSTNAME}

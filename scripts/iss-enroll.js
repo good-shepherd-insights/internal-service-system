@@ -194,7 +194,38 @@ form.addEventListener('submit', async (e) => {
 </html>`);
 });
 
+// Constant-time string compare (Node 22+ exposes timingSafeEqual on strings).
+import { timingSafeEqual } from 'node:crypto';
+
+function safeStrEq(a, b) {
+  const ab = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ab.length !== bb.length) {
+    timingSafeEqual(ab, ab); // burn a constant compare to keep timing flat
+    return false;
+  }
+  return timingSafeEqual(ab, bb);
+}
+
+// Per-IP rate limiter (in-memory, no deps).
+const hits = new Map(); // ip -> { count, resetAt }
+const WINDOW_MS = 60_000;
+const MAX_HITS = 10;
+function rateLimit(ip) {
+  const now = Date.now();
+  const e = hits.get(ip);
+  if (!e || e.resetAt < now) {
+    hits.set(ip, { count: 1, resetAt: now + WINDOW_MS });
+    return true;
+  }
+  e.count += 1;
+  return e.count <= MAX_HITS;
+}
+
 app.post('/api/enroll', async (c) => {
+  const ip = c.req.header('x-forwarded-for')?.split(',')[0].trim() || 'unknown';
+  if (!rateLimit(ip)) return c.json({error: 'Too many requests'}, 429);
+
   let body;
   try { body = await c.req.json(); } catch { return c.json({error: 'Invalid request'}, 400); }
   const name = (body.name || '').trim();
@@ -202,7 +233,7 @@ app.post('/api/enroll', async (c) => {
 
   if (!name) return c.json({error: 'Invalid name'}, 400);
   if (!/^[a-zA-Z0-9_-]{1,40}$/.test(name)) return c.json({error: 'Invalid name'}, 400);
-  if (password !== HOUSEHOLD_PASSWORD) return c.json({error: 'Wrong password'}, 401);
+  if (!safeStrEq(password, HOUSEHOLD_PASSWORD)) return c.json({error: 'Wrong password'}, 401);
 
   let acl = {};
   try { acl = JSON.parse(await readFile(ACL_PATH, 'utf8')); } catch { return c.json({error: 'ACL missing'}, 500); }
@@ -211,6 +242,7 @@ app.post('/api/enroll', async (c) => {
 
   let issuedMap = {};
   try { issuedMap = JSON.parse(await readFile(ISSUED_PATH, 'utf8').catch(() => '{}')); } catch {}
+  if (issuedMap[name]) return c.json({error: 'Name already used'}, 409);
 
   const tmp = await mkdtemp(join(tmpdir(), 'iss-enroll-'));
   const certPath = join(tmp, 'cert.pem');
@@ -262,7 +294,7 @@ app.post('/api/enroll', async (c) => {
     });
   } catch (err) {
     console.error('enroll error:', err);
-    return c.json({error: err.stderr ? err.stderr.toString() : 'Server error'}, 500);
+    return c.json({error: 'Server error'}, 500);
   } finally {
     await rm(tmp, {recursive: true, force: true}).catch(() => {});
   }

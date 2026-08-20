@@ -91,6 +91,13 @@ if ! command -v step >/dev/null 2>&1; then
   cd /tmp
   wget -q "https://github.com/smallstep/cli/releases/download/v${STEP_CLI_VERSION}/step-cli_${STEP_CLI_VERSION}-1_amd64.deb"
   wget -q "https://github.com/smallstep/certificates/releases/download/v${STEP_CA_VERSION}/step-ca_${STEP_CA_VERSION}-1_amd64.deb"
+  # Verify downloads look like valid .deb files (DPKG magic = "!<arch>\n").
+  for deb in /tmp/step-cli_${STEP_CLI_VERSION}-1_amd64.deb /tmp/step-ca_${STEP_CA_VERSION}-1_amd64.deb; do
+    if ! head -c 7 "$deb" | grep -q '^!<arch>'; then
+      echo "ERROR: $deb is not a valid .deb (release URL/version mismatch?)" >&2
+      exit 1
+    fi
+  done
   apt-get install -y "./step-cli_${STEP_CLI_VERSION}-1_amd64.deb" "./step-ca_${STEP_CA_VERSION}-1_amd64.deb"
   rm -f /tmp/step-cli-*.deb /tmp/step-ca-*.deb
 fi
@@ -99,6 +106,11 @@ if [[ ! -x /usr/local/bin/traefik ]]; then
   TRAEFIK_VERSION=3.6.25
   cd /tmp
   wget -q -O /tmp/traefik.tar.gz "https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_v${TRAEFIK_VERSION}_linux_amd64.tar.gz"
+  # Verify it's actually a gzip archive (magic bytes 1f 8b).
+  if [[ "$(head -c 2 /tmp/traefik.tar.gz | od -An -tx1 | tr -d ' ')" != "1f8b" ]]; then
+    echo "ERROR: traefik download is not a valid gzip archive (release URL/version mismatch?)" >&2
+    exit 1
+  fi
   tar -xzf /tmp/traefik.tar.gz -C /tmp traefik
   install -m 0755 /tmp/traefik /usr/local/bin/traefik
   rm -f /tmp/traefik /tmp/traefik.tar.gz
@@ -111,17 +123,23 @@ if ! id -u "$ISS_USER" >/dev/null 2>&1; then
   useradd -m -d "$ISS_HOME" "$ISS_USER"
 fi
 
+# Ensure home dir exists even if user existed but home was deleted.
+install -d -o "$ISS_USER" -g "$ISS_USER" "$ISS_HOME"
+
 mkdir -p "$ISS_CONFIG_DIR/certs" "$ISS_CONFIG_DIR/dynamic"
 mkdir -p /etc/traefik              # Traefik config dir (system location)
 mkdir -p "$ISS_HOME/.local/share/iss/scripts"
 mkdir -p "$ISS_STATE_DIR/enroll"
 
 # Avahi host-name from CA_HOSTNAME. The committed config has no host-name=
-# line; bootstrap appends it under [server].
-if ! grep -q "^host-name=" /etc/avahi/avahi-daemon.conf; then
-  sed -i "/^\[server\]/a host-name=${CA_HOSTNAME}" /etc/avahi/avahi-daemon.conf
-else
-  sed -i "s|^host-name=.*|host-name=${CA_HOSTNAME}|" /etc/avahi/avahi-daemon.conf
+# line; bootstrap appends it under [server]. Only on CA host — join hosts
+# publish their own hostname via avahi-publish-address unit.
+if $IS_CA_HOST; then
+  if ! grep -q "^host-name=" /etc/avahi/avahi-daemon.conf; then
+    sed -i "/^\[server\]/a host-name=${CA_HOSTNAME}" /etc/avahi/avahi-daemon.conf
+  else
+    sed -i "s|^host-name=.*|host-name=${CA_HOSTNAME}|" /etc/avahi/avahi-daemon.conf
+  fi
 fi
 
 if $IS_CA_HOST; then
@@ -148,7 +166,9 @@ c['defaultTLSCertDuration']='8760h0m0s'
 json.dump(d, open(p,'w'), indent=2)
 PYEOF
 
-  grep -q "^ca.local" /etc/hosts || echo "127.0.0.1 ca.local" >> /etc/hosts
+  if ! grep -qE "[[:space:]]ca\.local([[:space:]]|$)" /etc/hosts; then
+    echo "127.0.0.1 ca.local" >> /etc/hosts
+  fi
 
   # Install step-ca unit and start the daemon.
   install -m 0644 "$REPO_ROOT/etc/systemd/system/step-ca.service" /etc/systemd/system/step-ca.service
@@ -156,22 +176,27 @@ PYEOF
   systemctl enable --now step-ca
 
   for _ in $(seq 1 30); do
-    if curl -ksf https://ca.local:8443/health >/dev/null 2>&1; then break; fi
+    if curl --max-time 3 --connect-timeout 3 -ksf https://ca.local:8443/health >/dev/null 2>&1; then break; fi
     sleep 1
   done
 
-  # Add ACME provisioner (optional, for automation).
-  STEPPATH=/root/.step /usr/bin/step ca provisioner add acme --type ACME \
-    --ca-url https://ca.local:8443 --root /root/.step/certs/root_ca.crt \
-    --password-file /root/.step-pw || true
+  # Add ACME provisioner (idempotent — silently skip if already exists).
+  if ! STEPPATH=/root/.step /usr/bin/step ca provisioner list 2>/dev/null | grep -q '^acme'; then
+    STEPPATH=/root/.step /usr/bin/step ca provisioner add acme --type ACME \
+      --ca-url https://ca.local:8443 --root /root/.step/certs/root_ca.crt \
+      --password-file /root/.step-pw || {
+        echo "WARNING: ACME provisioner setup failed" >&2
+      }
+  fi
 
-  # Issue the CA host's server cert (skip if already issued).
-  if [[ ! -f "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local.pem" ]]; then
+  # Issue the CA host's server cert (skip if both cert+key already issued).
+  if [[ ! -f "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local.pem" \
+     || ! -f "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local-key.pem" ]]; then
     STEPPATH=/root/.step /usr/bin/step ca certificate "${CA_HOSTNAME}.local" \
       "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local.pem" \
       "$ISS_CONFIG_DIR/certs/${CA_HOSTNAME}.local-key.pem" \
       --provisioner admin --provisioner-password-file /root/.step-pw \
-      --san "${CA_HOSTNAME}.local" --san "${CA_IP}" --not-after 2160h
+      --san "${CA_HOSTNAME}.local" --san "${CA_IP}" --not-after 2160h --force
   fi
 
   cp /root/.step/certs/root_ca.crt "$ISS_CONFIG_DIR/dynamic/root_ca.crt"
@@ -194,6 +219,24 @@ sed -i \
   -e "s|<ISS_CONFIG_DIR>|${ISS_CONFIG_DIR}|g" \
   -e "s|<ISS_HOME>|${ISS_HOME}|g" \
   "$ISS_CONFIG_DIR/dynamic/iss.yml"
+
+# Optional separate-hostname enroll router (only if ENROLL_HOSTNAME set).
+if [[ -n "${ENROLL_HOSTNAME:-}" ]]; then
+  cat > "$ISS_CONFIG_DIR/dynamic/enroll.yml" <<EOF
+http:
+  routers:
+    enroll:
+      rule: "Host(\`${ENROLL_HOSTNAME}\`)"
+      entryPoints: [web]
+      service: enroll-svc
+  services:
+    enroll-svc:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://127.0.0.1:${ENROLL_PORT}"
+EOF
+fi
 
 if ! $IS_CA_HOST; then
   if [[ ! -f "$ISS_CONFIG_DIR/dynamic/root_ca.crt" ]]; then
@@ -253,9 +296,14 @@ Environment=CA_HOSTNAME=${CA_HOSTNAME}
 Environment=CA_IP=${CA_IP}
 Environment=CA_NAME=${CA_NAME}
 Environment=ISS_NAME=${ISS_NAME}
-Environment=ENROLL_HOUSEHOLD_PASSWORD=${ENROLL_HOUSEHOLD_PASSWORD}
-Environment=ENROLL_P12_PASSWORD=${ENROLL_P12_PASSWORD}
 Environment=ENROLL_PORT=${ENROLL_PORT}
+EnvironmentFile=-${ISS_CONFIG_DIR}/enroll-secrets.env
+EOF
+  install -m 0600 /dev/null "${ISS_CONFIG_DIR}/enroll-secrets.env"
+  chmod 0600 "${ISS_CONFIG_DIR}/enroll-secrets.env"
+  cat > "${ISS_CONFIG_DIR}/enroll-secrets.env" <<EOF
+ENROLL_HOUSEHOLD_PASSWORD=${ENROLL_HOUSEHOLD_PASSWORD}
+ENROLL_P12_PASSWORD=${ENROLL_P12_PASSWORD}
 EOF
 
   # Install acl.json template if missing.
@@ -295,7 +343,7 @@ fi
 
 echo
 echo "=== Verification ==="
-if curl -ksf https://ca.local:8443/health >/dev/null 2>&1; then
+if curl --max-time 3 --connect-timeout 3 -ksf https://ca.local:8443/health >/dev/null 2>&1; then
   echo "step-ca: OK"
 else
   echo "step-ca: FAIL"

@@ -18,11 +18,12 @@ and every committed file is brand-agnostic. Fork it, brand it, deploy.
 4. [Adding a new service](#adding-a-new-service)
 5. [Adding a new user](#adding-a-new-user)
 6. [Joining a second host](#joining-a-second-host)
-7. [Revoking a user](#revoking-a-user)
-8. [Backing up](#backing-up)
-9. [Troubleshooting](#troubleshooting)
-10. [Repo layout](#repo-layout)
-11. [Caveats](#caveats)
+7. [Re-enrolling a user](#re-enrolling-a-user)
+8. [Revoking a user](#revoking-a-user)
+9. [Backing up](#backing-up)
+10. [Troubleshooting](#troubleshooting)
+11. [Repo layout](#repo-layout)
+12. [Caveats](#caveats)
 
 ---
 
@@ -126,6 +127,7 @@ step-ca root (self-signed)
 - Traefik dynamic config in `/etc/iss/dynamic/` is watched live. Edit the YAML; reload is automatic.
 - mTLS is a hard gate. No click-through, no opt-out, no anonymous access.
 - Revocation: step-ca auto-generates CRL every 60s. Traefik picks it up. To revoke a user, delete their entry from `/etc/iss/acl.json`. (CRL alone is not enough; without an ACL entry Traefik will still 403 them but the cert is technically valid. ACL removal is the operational revoke.)
+- ACL enforcement happens in the operator's backend service, not in Traefik. Traefik enforces mTLS (cert + chain); the operator's service reads `acl.json` and 403s on SAN mismatch. If you want Traefik-level ACL enforcement, deploy an ACL forward-auth middleware (separate design).
 
 **Why this design (vs alternatives):**
 
@@ -307,6 +309,20 @@ What happens on a join host:
 
 ---
 
+## Re-enrolling a user
+
+The user forgot their .p12 password, lost their device, or wants a fresh cert.
+
+1. Delete the user's entry from `<ISS_STATE_DIR>/enroll/issued.json` (the
+   "issued tracker"). This unblocks re-enrollment.
+2. User goes to `http://<ENROLL_HOSTNAME>` (default: enroll app on the
+   CA host's port — see "Adding a service" if no separate hostname is set).
+3. New `.p12` is issued with the same name and a fresh keypair.
+
+The old cert remains valid (CRL aside). To fully invalidate the old
+cert, also remove the user's entry from `<ISS_CONFIG_DIR>/acl.json` and
+follow "Revoking a user" below.
+
 ## Revoking a user
 
 1. Delete or comment out the user's entry in `/etc/iss/acl.json`.
@@ -383,7 +399,7 @@ Restore from git history (`git rm --cached .env && git commit`). Rotate any pass
 
 ## Repo layout
 
-```
+```text
 internal-service-system/
 ├── bootstrap.sh                          — one-shot installer. Idempotent.
 ├── README.md                             — this file.

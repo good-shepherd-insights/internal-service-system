@@ -21,7 +21,7 @@ http:
       rule: "Host(`<CA_HOSTNAME>.local`)"
       entryPoints: [web]
       middlewares: [redirect-https-mw]
-      service: dummy@internal
+      service: noop@internal
   middlewares:
     redirect-https-mw:
       redirectScheme:
@@ -33,8 +33,3 @@ http:
         passHostHeader: false
         servers:
           - url: "http://127.0.0.1:<DASHBOARD_PORT>"
-    dummy:
-      loadBalancer:
-        passHostHeader: false
-        servers:
-          - url: "http://127.0.0.1:65535"

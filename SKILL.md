@@ -50,6 +50,11 @@ Read these from `.env`:
 ```bash
 cd /home/dev/internal-service-system
 
+# Make validated values available to later commands.
+set -a
+source .env
+set +a
+
 required=(CA_HOSTNAME CA_NAME CA_IP JOIN_AS_CA ISS_USER ISS_HOME \
           ISS_CONFIG_DIR ISS_STATE_DIR ISS_NAME \
           ENROLL_HOUSEHOLD_PASSWORD ENROLL_P12_PASSWORD)
@@ -72,9 +77,16 @@ fi
 
 If anything is missing, **stop and ask the operator** which value to use. Do not guess.
 
-## Step 2: Syntax check before install
+## Step 2: Install validation deps + syntax check
 
 ```bash
+# Validation tools.
+command -v bash >/dev/null || { echo "bash missing"; exit 1; }
+command -v node >/dev/null || apt-get install -y nodejs
+command -v python3 >/dev/null || apt-get install -y python3
+python3 -c "import yaml" 2>/dev/null || apt-get install -y python3-yaml
+
+# Syntax checks (all must exit 0).
 bash -n bootstrap.sh
 node --check scripts/iss-enroll.js
 python3 -c "import yaml; yaml.safe_load(open('etc/traefik/dynamic/iss.yml'))"
@@ -85,8 +97,14 @@ All three must exit 0. If any fails, **stop and report the error**.
 ## Step 3: Run bootstrap
 
 ```bash
+set -o pipefail
 sudo ./bootstrap.sh 2>&1 | tee /tmp/iss-bootstrap.log
+rc=${PIPESTATUS[0]}
+exit $rc
 ```
+
+`PIPESTATUS[0]` preserves the bootstrap's exit status so the agent can
+react to failures instead of silently getting `tee`'s 0.
 
 The script is idempotent. Re-running on a configured host is safe. New vars in `.env` are picked up on the next run; existing values are not overwritten.
 
@@ -95,7 +113,7 @@ The script will:
 - Refuse to run on OpenSSL < 3.5 (Ubuntu 24.04 and older).
 - Install `avahi-daemon`, `avahi-utils`, `nodejs`, `step-cli`, `step-ca`, Traefik 3.6.25.
 - `step ca init` if `/root/.step/config/ca.json` does not exist. The CA name comes from `.env:CA_NAME`.
-- Configure step-ca: 2160h cert duration, ACL extended, CRL enabled, ACME provisioner `acme`.
+- Configure step-ca: **8760h CA cert** (step-cli default), **2160h user/server certs** (explicit `--not-after 2160h`), CRL enabled, ACME provisioner `acme`.
 - Issue a server cert for `<CA_HOSTNAME>.local`.
 - Render the systemd unit for the enroll app from the template `etc/systemd/system/iss-enroll.service`. Placeholders substituted: `<ISS_NAME>`, `<ISS_USER>`, `<ISS_HOME>`, `<ISS_CONFIG_DIR>`, `<CA_HOSTNAME>`, `<ENROLL_PORT>`.
 - Render the Traefik dynamic config from `etc/traefik/dynamic/iss.yml`. Placeholders substituted: `<ISS_CONFIG_DIR>`, `<CA_HOSTNAME>`, `<DASHBOARD_PORT>`, `<ENROLL_PORT>`.
@@ -129,21 +147,29 @@ The first three must return 200. The fourth returns 502 because no dashboard bac
 Before any device can connect, the operator needs to add an ACL entry:
 
 ```bash
-# Edit /etc/iss/acl.json
+# Edit ${ISS_CONFIG_DIR}/acl.json (operator's choice — defaults to /etc/iss/acl.json)
+cat > "${ISS_CONFIG_DIR}/acl.json" <<EOF
 {
   "anthony": ["<CA_HOSTNAME>.local"]
 }
+EOF
 ```
 
 Then distribute the root cert to the user's device:
 
 ```bash
-# Mac: double-click /etc/iss/dynamic/root_ca.crt, add to System keychain
-# Linux: sudo cp /etc/iss/dynamic/root_ca.crt /usr/local/share/ca-certificates/iss-root.crt && sudo update-ca-certificates
+# Transfer root cert to the user's machine first, then:
+# Mac: double-click ${ISS_CONFIG_DIR}/dynamic/root_ca.crt, add to System keychain
+# Linux: sudo cp /root/iss-config/dynamic/root_ca.crt /usr/local/share/ca-certificates/iss-root.crt && sudo update-ca-certificates
 # Windows: import to Trusted Root Certification Authorities
 ```
 
-The user opens `http://<CA_HOSTNAME>.local`, types their name + the household password from `.env:ENROLL_HOUSEHOLD_PASSWORD`, gets a `.p12`. They import the `.p12` to their OS keychain (typing `.env:ENROLL_P12_PASSWORD` on Mac). They browse to `https://<CA_HOSTNAME>.local`.
+The user opens `http://<ENROLL_HOSTNAME>` (default: enroll app on the CA
+host's port — operators can set `ENROLL_HOSTNAME=enroll.local` in `.env`
+to get a dedicated hostname). They type their name + the household
+password from `.env:ENROLL_HOUSEHOLD_PASSWORD`, get a `.p12`. They
+import the `.p12` to their OS keychain (typing `.env:ENROLL_P12_PASSWORD`
+on Mac). They browse to `https://<CA_HOSTNAME>.local`.
 
 ## Pitfalls
 

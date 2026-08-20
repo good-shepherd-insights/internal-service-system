@@ -4,7 +4,11 @@ After=step-ca.service
 
 [Service]
 Type=simple
-User=<ISS_USER>
+User=root
+# The enroll app must read /root/.step-pw and /root/.step/certs/ which are
+# root-only. It listens on 127.0.0.1:<ENROLL_PORT> only, so root is safe
+# (Traefik fronts it). Operators who need non-root can move STEPPATH out of
+# /root and set EnvironmentFile= in the drop-in.
 WorkingDirectory=<ISS_HOME>/.local/share/iss/npm
 ExecStart=/usr/bin/node <ISS_SCRIPTS_DIR>/<CA_HOSTNAME>-enroll.js
 Environment=ENROLL_PORT=<ENROLL_PORT>

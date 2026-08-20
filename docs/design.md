@@ -111,7 +111,7 @@ Each service running on a service host has its own cert, issued at setup:
 
 ```
 step ca certificate <svc>.<host>.local cert.pem key.pem \
-  --ca-url https://ca.local:8443 \
+  --ca-url https://<CA_HOSTNAME>.local:8443 \
   --san <svc>.<host>.local --san <host_ip> --not-after 2160h
 ```
 

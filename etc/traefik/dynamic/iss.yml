@@ -1,0 +1,35 @@
+tls:
+  certificates:
+    - certFile: <ISS_CONFIG_DIR>/certs/<CA_HOSTNAME>.local.pem
+      keyFile: <ISS_CONFIG_DIR>/certs/<CA_HOSTNAME>.local-key.pem
+  options:
+    mtls:
+      clientAuth:
+        caFiles:
+          - <ISS_CONFIG_DIR>/dynamic/root_ca.crt
+          - <ISS_CONFIG_DIR>/dynamic/intermediate_ca.crt
+        clientAuthType: RequireAndVerifyClientCert
+http:
+  routers:
+    dashboard:
+      rule: "Host(`<CA_HOSTNAME>.local`)"
+      entryPoints: [websecure]
+      service: dashboard-svc
+      tls:
+        options: mtls
+    redirect-https:
+      rule: "Host(`<CA_HOSTNAME>.local`)"
+      entryPoints: [web]
+      middlewares: [redirect-https-mw]
+      service: noop@internal
+  middlewares:
+    redirect-https-mw:
+      redirectScheme:
+        scheme: https
+        permanent: true
+  services:
+    dashboard-svc:
+      loadBalancer:
+        passHostHeader: false
+        servers:
+          - url: "http://127.0.0.1:<DASHBOARD_PORT>"

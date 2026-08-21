@@ -1,0 +1,25 @@
+[Unit]
+Description=<ISS_NAME> cert enrollment
+After=step-ca.service
+
+[Service]
+Type=simple
+User=root
+# The enroll app must read /root/.step-pw and /root/.step/certs/ which are
+# root-only. It listens on 127.0.0.1:<ENROLL_PORT> only, so root is safe
+# (Traefik fronts it). Operators who need non-root can move STEPPATH out of
+# /root and set EnvironmentFile= in the drop-in.
+WorkingDirectory=<ISS_HOME>/.local/share/iss/npm
+ExecStart=/usr/bin/node <ISS_SCRIPTS_DIR>/<CA_HOSTNAME>-enroll.js
+Environment=ENROLL_PORT=<ENROLL_PORT>
+# ENROLL_HOUSEHOLD_PASSWORD, ENROLL_P12_PASSWORD, ISS_STATE_DIR, ISS_CONFIG_DIR,
+# CA_HOSTNAME, CA_IP, CA_NAME, ISS_NAME, STEPPATH are set by the
+# bootstrap-created drop-in at
+# /etc/systemd/system/<this-unit>.d/env.conf so they never appear in this file.
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
